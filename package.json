@@ -1,0 +1,45 @@
+{
+  "name": "@rurout/opencode-v1",
+  "version": "0.1.0",
+  "description": "OpenCode 1.x provider plugin for RuRout — live model discovery from your gateway key.",
+  "author": "rurout",
+  "keywords": [
+    "opencode",
+    "rurout",
+    "provider",
+    "plugin",
+    "openai-compatible",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abboltuz/opencode-rurout-v1.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.31"
+  },
+  "devDependencies": {
+    "@opencode-ai/sdk": "^1.18.31",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}
