@@ -5,6 +5,7 @@ import {
   PROVIDER_NAME,
 } from "./constants.js";
 import { fetchGatewayModels } from "./discovery.js";
+import { keyFingerprint, purgeLegacyFileCache } from "./cache.js";
 import {
   canonicalId,
   displayName,
@@ -25,11 +26,74 @@ function baseURLFrom(opts: RuroutOptions): string {
   return raw.replace(/\/$/, "");
 }
 
-function resolveApiKey(provider: AnyRecord | undefined): string {
+function providerApiKeys(provider: AnyRecord | undefined): string[] {
+  const keys: string[] = [];
   const options = (provider?.options ?? {}) as Record<string, unknown>;
-  const rawKey = options.apiKey;
-  if (typeof rawKey === "string" && rawKey.length > 0) return rawKey;
-  return process.env.RUROUT_API_KEY ?? "";
+  for (const field of ["apiKey", "api_key", "key", "token"] as const) {
+    const raw = options[field];
+    if (typeof raw === "string" && raw.length > 0 && !keys.includes(raw)) keys.push(raw);
+  }
+  const envKey = process.env.RUROUT_API_KEY ?? "";
+  if (envKey && !keys.includes(envKey)) keys.push(envKey);
+  return keys;
+}
+
+function resolveApiKey(provider: AnyRecord | undefined): string {
+  return providerApiKeys(provider)[0] ?? "";
+}
+
+const seenKeyFingerprints = new Set<string>();
+
+function unseenKeys(keys: string[]): string[] {
+  return keys.filter((key) => {
+    const fingerprint = keyFingerprint(key);
+    if (seenKeyFingerprints.has(fingerprint)) return false;
+    seenKeyFingerprints.add(fingerprint);
+    return true;
+  });
+}
+
+async function buildModelsForKey(
+  input: PluginInput,
+  baseURL: string,
+  apiKey: string,
+): Promise<{ models: Record<string, AnyRecord>; keyLabel: string } | null> {
+  let live;
+  try {
+    live = await fetchGatewayModels(baseURL, apiKey);
+  } catch (err) {
+    await log(
+      input,
+      "warn",
+      `[rurout] model discovery failed for key ${keyFingerprint(apiKey)}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+
+  const groups = new Map<string, { ids: string[]; display?: string }>();
+  for (const m of live) {
+    const canonical = canonicalId(m.id);
+    const entry = groups.get(canonical) ?? { ids: [] };
+    entry.ids.push(m.id);
+    if (!entry.display && m.display_name && m.display_name !== m.id) {
+      entry.display = m.display_name;
+    }
+    groups.set(canonical, entry);
+  }
+  const keyLabel = await fetchKeyLabel(baseURL, apiKey);
+  const models: Record<string, AnyRecord> = {};
+  for (const [canonical, entry] of groups) {
+    const apiId = pickApiId(entry.ids);
+    const model = toV1Model(canonical, apiId, entry.display) as AnyRecord;
+    const modelName = typeof model.name === "string" ? model.name : canonical;
+    if (keyLabel) {
+      model.name = `RuRout ${keyLabel} ${displayName(apiId, entry.display)}`;
+    } else {
+      model.name = modelName;
+    }
+    models[canonical] = model;
+  }
+  return { models, keyLabel };
 }
 
 async function log(
@@ -128,48 +192,47 @@ async function ruroutPlugin(input: PluginInput, rawOpts?: RuroutOptions): Promis
       };
       root.provider[PROVIDER_ID] = provider;
 
-      const apiKey = resolveApiKey(provider);
-      if (!apiKey) {
+      await purgeLegacyFileCache((message) => void log(input, "info", message));
+
+      const keys = providerApiKeys(provider);
+      if (keys.length === 0) {
         await log(input, "warn", "[rurout] no API key yet — run /connect rurout, then restart");
         return;
       }
 
-      let live;
-      try {
-        live = await fetchGatewayModels(baseURL, apiKey);
-      } catch (err) {
-        await log(
-          input,
-          "warn",
-          `[rurout] model discovery failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+      const freshKeys = unseenKeys(keys);
+      if (freshKeys.length === 0) {
+        await log(input, "info", "[rurout] keys unchanged — models already discovered, skipping gateway fetch");
         return;
       }
 
-      const groups = new Map<string, { ids: string[]; display?: string }>();
-      for (const m of live) {
-        const canonical = canonicalId(m.id);
-        const entry = groups.get(canonical) ?? { ids: [] };
-        entry.ids.push(m.id);
-        if (!entry.display && m.display_name && m.display_name !== m.id) {
-          entry.display = m.display_name;
+      const merged: Record<string, AnyRecord> = {};
+      const labels: string[] = [];
+      let ok = 0;
+      for (const apiKey of freshKeys) {
+        const built = await buildModelsForKey(input, baseURL, apiKey);
+        if (!built) continue;
+        ok += 1;
+        if (built.keyLabel && !labels.includes(built.keyLabel)) labels.push(built.keyLabel);
+        for (const [id, model] of Object.entries(built.models)) {
+          const prev = merged[id] as AnyRecord | undefined;
+          if (prev) {
+            const prevName = typeof prev.name === "string" ? prev.name : "";
+            const modelName = typeof model.name === "string" ? model.name : id;
+            if (built.keyLabel && !prevName.includes(built.keyLabel)) {
+              prev.name = `${prevName} + ${built.keyLabel}`.trim();
+            } else if (!prevName) {
+              prev.name = modelName;
+            }
+            continue;
+          }
+          merged[id] = model as AnyRecord;
         }
-        groups.set(canonical, entry);
       }
-      const keyLabel = await fetchKeyLabel(baseURL, apiKey);
-      const providerName = keyLabel ? `RuRout ${keyLabel}` : PROVIDER_NAME;
-      provider.name = providerName;
-      const models: Record<string, AnyRecord> = {};
-      for (const [canonical, entry] of groups) {
-        const apiId = pickApiId(entry.ids);
-        const model = toV1Model(canonical, apiId, entry.display);
-        if (keyLabel) {
-          model.name = `${providerName} ${displayName(apiId, entry.display)}`;
-        }
-        models[canonical] = model;
-      }
-      provider.models = models;
-      await log(input, "info", `[rurout] discovered ${Object.keys(models).length} models`);
+      if (ok === 0) return;
+      provider.name = labels.length > 0 ? `RuRout ${labels.join(" + ")}`.slice(0, 64) : PROVIDER_NAME;
+      provider.models = merged;
+      await log(input, "info", `[rurout] discovered ${Object.keys(merged).length} models from ${ok} key(s)`);
     },
 
     auth: {
