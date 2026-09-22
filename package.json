@@ -1,6 +1,6 @@
 {
   "name": "@rurout/opencode-v1",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "OpenCode 1.x provider plugin for RuRout — live model discovery from your gateway key.",
   "author": "rurout",
   "keywords": [
