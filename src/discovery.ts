@@ -36,11 +36,6 @@ export async function fetchGatewayModels(
     const body = (await response.json()) as { data?: GatewayModel[] };
     const list = Array.isArray(body.data) ? body.data : [];
     const models = list.filter((m) => typeof m?.id === "string" && m.id.length > 0);
-    if (models.length === 0) {
-      lastError = "gateway returned an empty model list";
-      await sleep(300 * (attempt + 1));
-      continue;
-    }
     return models;
   }
   throw new Error(`gateway discovery failed at ${url}: ${lastError}`);

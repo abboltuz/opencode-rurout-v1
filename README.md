@@ -7,10 +7,10 @@ OpenCode **1.x** provider plugin for [RuRout](https://rurout.online) — your ga
 ## What the client gets
 
 - New `RuRout` provider in the OpenCode model picker, next to the built-ins.
-- Model list discovered live from `GET /v1/models` with the client's own key — each client sees exactly the models their key allows, deduplicated to one entry per model family.
+- Model list discovered live from `GET /v1/models` with the active key — each client sees exactly the models that key allows.
 - Provider and model names include the admin-given key name from `GET /v1/sub2api/billing` (e.g. `RuRout Germes`).
 - `/connect rurout` stores the key in OpenCode's auth system.
-- Pool refreshes live from the gateway on every startup; every new key triggers its own discovery (all configured keys are fetched, models merged), already-seen keys are skipped. Stale `~/.cache/opencode-rurout/models-*.json` files are deleted on startup so old lists never shadow fresh results.
+- The active key is checked on startup and hourly without a restart. A successful refresh replaces the list, including removing models unavailable to the key. Stale `~/.cache/opencode-rurout/models-*.json` files are deleted on startup.
 
 ## Install (OpenCode 1.x only)
 
@@ -53,4 +53,4 @@ Or `export RUROUT_BASE_URL=...`.
 
 ## How it works
 
-The v1 `config` hook registers the `rurout` provider with `@ai-sdk/openai-compatible`, fetches `GET /v1/models` with the client's key, groups alias ids (dates, preview, thinking, tiered, flash high/medium/low) to one canonical entry, and fills in context/pricing metadata. The `auth` hook adds `/connect rurout`.
+The v1 `config` hook registers the `rurout` provider with `@ai-sdk/openai-compatible`, fetches `GET /v1/models` with the active key, preserves the exact IDs returned by the gateway, and fills in context/pricing metadata. The `auth` hook adds `/connect rurout`.

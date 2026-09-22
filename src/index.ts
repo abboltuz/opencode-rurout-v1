@@ -7,7 +7,6 @@ import {
 import { fetchGatewayModels } from "./discovery.js";
 import { keyFingerprint, purgeLegacyFileCache } from "./cache.js";
 import {
-  canonicalId,
   displayName,
   familyOf,
   isImage,
@@ -26,31 +25,17 @@ function baseURLFrom(opts: RuroutOptions): string {
   return raw.replace(/\/$/, "");
 }
 
-function providerApiKeys(provider: AnyRecord | undefined): string[] {
-  const keys: string[] = [];
+function providerApiKey(provider: AnyRecord | undefined): string {
   const options = (provider?.options ?? {}) as Record<string, unknown>;
   for (const field of ["apiKey", "api_key", "key", "token"] as const) {
     const raw = options[field];
-    if (typeof raw === "string" && raw.length > 0 && !keys.includes(raw)) keys.push(raw);
+    if (typeof raw === "string" && raw.length > 0) return raw;
   }
-  const envKey = process.env.RUROUT_API_KEY ?? "";
-  if (envKey && !keys.includes(envKey)) keys.push(envKey);
-  return keys;
+  return process.env.RUROUT_API_KEY ?? "";
 }
 
 function resolveApiKey(provider: AnyRecord | undefined): string {
-  return providerApiKeys(provider)[0] ?? "";
-}
-
-const seenKeyFingerprints = new Set<string>();
-
-function unseenKeys(keys: string[]): string[] {
-  return keys.filter((key) => {
-    const fingerprint = keyFingerprint(key);
-    if (seenKeyFingerprints.has(fingerprint)) return false;
-    seenKeyFingerprints.add(fingerprint);
-    return true;
-  });
+  return providerApiKey(provider);
 }
 
 async function buildModelsForKey(
@@ -70,28 +55,19 @@ async function buildModelsForKey(
     return null;
   }
 
-  const groups = new Map<string, { ids: string[]; display?: string }>();
-  for (const m of live) {
-    const canonical = canonicalId(m.id);
-    const entry = groups.get(canonical) ?? { ids: [] };
-    entry.ids.push(m.id);
-    if (!entry.display && m.display_name && m.display_name !== m.id) {
-      entry.display = m.display_name;
-    }
-    groups.set(canonical, entry);
-  }
   const keyLabel = await fetchKeyLabel(baseURL, apiKey);
   const models: Record<string, AnyRecord> = {};
-  for (const [canonical, entry] of groups) {
-    const apiId = pickApiId(entry.ids);
-    const model = toV1Model(canonical, apiId, entry.display) as AnyRecord;
-    const modelName = typeof model.name === "string" ? model.name : canonical;
+  for (const entry of live) {
+    // Preserve the exact ID returned for this key. Alias collapsing can select
+    // an ID unavailable to the active key.
+    const model = toV1Model(entry.id, entry.id, entry.display_name) as AnyRecord;
+    const modelName = typeof model.name === "string" ? model.name : entry.id;
     if (keyLabel) {
-      model.name = `RuRout ${keyLabel} ${displayName(apiId, entry.display)}`;
+      model.name = `RuRout ${keyLabel} ${displayName(entry.id, entry.display_name)}`;
     } else {
       model.name = modelName;
     }
-    models[canonical] = model;
+    models[entry.id] = model;
   }
   return { models, keyLabel };
 }
@@ -128,20 +104,6 @@ function toV1Model(canonical: string, apiId: string, display: string | undefined
   };
 }
 
-function pickApiId(ids: string[]): string {
-  const rank = (id: string): number => {
-    if (/-tiered$/i.test(id)) return 0;
-    if (/-medium$/i.test(id)) return 1;
-    if (/-high$/i.test(id)) return 2;
-    if (/-low$/i.test(id)) return 3;
-    if (/-thinking$/i.test(id)) return 4;
-    if (/-preview$/i.test(id)) return 5;
-    if (/-\d{8}$/.test(id)) return 6;
-    return 7;
-  };
-  return [...ids].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0))[0]!;
-}
-
 async function fetchKeyLabel(baseURL: string, apiKey: string): Promise<string> {
   try {
     const response = await fetch(`${baseURL.replace(/\/$/, "")}/sub2api/billing`, {
@@ -174,6 +136,28 @@ function sanitizeLabel(raw: string): string {
 
 async function ruroutPlugin(input: PluginInput, rawOpts?: RuroutOptions): Promise<Hooks> {
   const baseURL = baseURLFrom(rawOpts ?? {});
+  const refreshTimer = setInterval(() => {
+    void (async () => {
+      try {
+        // Reapply the running configuration so the config hook resolves the
+        // current auth key and replaces the model inventory without a restart.
+        const response = await (input.client.config.get as any)({
+          query: { directory: input.directory },
+        });
+        const config = (response as AnyRecord)?.data ?? response;
+        if (!config || typeof config !== "object") return;
+        await (input.client.config.update as any)({
+          query: { directory: input.directory },
+          body: config,
+        });
+      } catch {
+        // The next hourly tick retries; keep the last successful inventory.
+      }
+    })();
+  }, 60 * 60 * 1000);
+  if (typeof (refreshTimer as unknown as { unref?: () => void }).unref === "function") {
+    (refreshTimer as unknown as { unref: () => void }).unref();
+  }
   return {
     async config(config: Config) {
       const root = config as AnyRecord;
@@ -194,45 +178,16 @@ async function ruroutPlugin(input: PluginInput, rawOpts?: RuroutOptions): Promis
 
       await purgeLegacyFileCache((message) => void log(input, "info", message));
 
-      const keys = providerApiKeys(provider);
-      if (keys.length === 0) {
-        await log(input, "warn", "[rurout] no API key yet — run /connect rurout, then restart");
-        return;
-      }
-
-      const freshKeys = unseenKeys(keys);
-      if (freshKeys.length === 0) {
-        await log(input, "info", "[rurout] keys unchanged — models already discovered, skipping gateway fetch");
-        return;
-      }
-
-      const merged: Record<string, AnyRecord> = {};
-      const labels: string[] = [];
-      let ok = 0;
-      for (const apiKey of freshKeys) {
-        const built = await buildModelsForKey(input, baseURL, apiKey);
-        if (!built) continue;
-        ok += 1;
-        if (built.keyLabel && !labels.includes(built.keyLabel)) labels.push(built.keyLabel);
-        for (const [id, model] of Object.entries(built.models)) {
-          const prev = merged[id] as AnyRecord | undefined;
-          if (prev) {
-            const prevName = typeof prev.name === "string" ? prev.name : "";
-            const modelName = typeof model.name === "string" ? model.name : id;
-            if (built.keyLabel && !prevName.includes(built.keyLabel)) {
-              prev.name = `${prevName} + ${built.keyLabel}`.trim();
-            } else if (!prevName) {
-              prev.name = modelName;
-            }
-            continue;
-          }
-          merged[id] = model as AnyRecord;
-        }
-      }
-      if (ok === 0) return;
-      provider.name = labels.length > 0 ? `RuRout ${labels.join(" + ")}`.slice(0, 64) : PROVIDER_NAME;
-      provider.models = merged;
-      await log(input, "info", `[rurout] discovered ${Object.keys(merged).length} models from ${ok} key(s)`);
+       const apiKey = resolveApiKey(provider);
+       if (!apiKey) {
+         await log(input, "warn", "[rurout] no API key yet — run /connect rurout, then restart");
+         return;
+       }
+       const built = await buildModelsForKey(input, baseURL, apiKey);
+       if (!built) return;
+       provider.name = built.keyLabel ? `RuRout ${built.keyLabel}` : PROVIDER_NAME;
+       provider.models = built.models;
+       await log(input, "info", `[rurout] discovered ${Object.keys(built.models).length} models for active key ${keyFingerprint(apiKey)}`);
     },
 
     auth: {
@@ -267,6 +222,9 @@ async function ruroutPlugin(input: PluginInput, rawOpts?: RuroutOptions): Promis
         }
       },
     } satisfies AuthHook,
+    dispose: async () => {
+      clearInterval(refreshTimer);
+    },
   };
 }
 
